@@ -35,7 +35,7 @@
 	},
 	"dependencies": {
 		"@earendil-works/chord": "1.0.2",
-		"@earendil-works/pi-coding-agent": "1.0.0",
+		"@earendil-works/pi-coding-agent": "1.0.2",
 		"@earendil-works/pi-durable": "1.0.2",
 		"@opentelemetry/api": "^1.1.0",
 		"@rivet-dev/sandbox-adapter": "workspace:*"
