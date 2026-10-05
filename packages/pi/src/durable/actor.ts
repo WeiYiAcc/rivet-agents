@@ -39,6 +39,12 @@ import {
 /** Ten minutes. `submission.wait` and `prompt` wait for a whole run. */
 const DEFAULT_ACTION_TIMEOUT_MS = 10 * 60_000;
 
+/**
+ * Fifteen minutes, so a running model call or tool call can finish before a
+ * deploy moves the actor. The engine's stop threshold still bounds it.
+ */
+const DEFAULT_SLEEP_GRACE_PERIOD_MS = 15 * 60_000;
+
 /** Watch frames, sent only to the connection that asked. See `PiWatchEvents`. */
 export type PiDurableEvents = {
 	"pi.events": Type<PiEventsFrame>;
@@ -382,11 +388,14 @@ export function piDurable<
 	const userOnDestroy = withPi(actorConfig.onDestroy);
 	const userOnDisconnect = withPi(actorConfig.onDisconnect);
 	delete actorConfig.vars;
+	const sleepGracePeriod: number =
+		actorConfig.options?.sleepGracePeriod ?? DEFAULT_SLEEP_GRACE_PERIOD_MS;
 
 	return actor({
 		...actorConfig,
 		options: {
 			actionTimeout: DEFAULT_ACTION_TIMEOUT_MS,
+			sleepGracePeriod: DEFAULT_SLEEP_GRACE_PERIOD_MS,
 			...actorConfig.options,
 		},
 		db: db({ onMigrate: migratePiDurableTables }),
@@ -405,25 +414,29 @@ export function piDurable<
 		},
 		// Opening on wake resumes interrupted work, after the app's own onWake.
 		onWake: async (c: PiContext) => {
-			const opened = openOnWake(c, durableOptions);
-			if (userOnWake) {
-				const harness = await opened;
-				try {
-					await withPiAccess(c, durableOptions, () => userOnWake(c));
-				} finally {
-					harness.resume();
-				}
-				return;
+			let harness: Harness | undefined;
+			try {
+				harness = await openOnWake(c, durableOptions);
+				Object.defineProperty(c, "pi", { value: harness, configurable: true });
+			} catch (error) {
+				// The actor stays up so actions can report the cause, such as a
+				// schema newer than the code. Using c.pi throws it.
+				c.log.error({
+					msg: "pi durable could not open on wake; actions will retry",
+					error,
+				});
+				Object.defineProperty(c, "pi", {
+					get: () => {
+						throw error;
+					},
+					configurable: true,
+				});
 			}
-			await opened.then(
-				(harness) => harness.resume(),
-				(error: unknown) => {
-					c.log.error({
-						msg: "pi durable could not open on wake; actions will retry",
-						error,
-					});
-				},
-			);
+			try {
+				await userOnWake?.(c);
+			} finally {
+				harness?.resume();
+			}
 		},
 		onConnect: withPi(actorConfig.onConnect),
 		onDisconnect: async (c: PiContext, conn: { id: string }) => {
@@ -438,14 +451,14 @@ export function piDurable<
 			try {
 				await userOnSleep?.(c);
 			} finally {
-				await closeHarness(c, durableOptions, "sleep");
+				await closeHarness(c, durableOptions, "sleep", sleepGracePeriod);
 			}
 		},
 		onDestroy: async (c: PiContext) => {
 			try {
 				await userOnDestroy?.(c);
 			} finally {
-				await closeHarness(c, durableOptions, "destroy");
+				await closeHarness(c, durableOptions, "destroy", sleepGracePeriod);
 			}
 		},
 	} as any) as any;
