@@ -46,6 +46,58 @@ function buildRegistry(mock: MockModel, root: string) {
 				c.sleep();
 			},
 			sleeps: (c) => c.state.sleeps,
+			addNote: (c, text: string) =>
+				c.pi.sendCustomMessage({
+					customType: "note",
+					content: text,
+					display: true,
+				}),
+			// Rewrites the stored session as pi-coding-agent's version 2 format stored it:
+			// an extension message was a message entry with role `hookMessage`.
+			storeInVersion2Format: async (c) => {
+				await c.db.execute(
+					`UPDATE pi_session SET header_json = json_set(header_json, '$.version', 2)`,
+				);
+				const rows = await c.db.execute<{ seq: number; entry_json: string }>(
+					`SELECT seq, entry_json FROM pi_entry WHERE json_extract(entry_json, '$.type') = 'custom_message'`,
+				);
+				for (const row of rows) {
+					const {
+						type: _type,
+						customType,
+						content,
+						display,
+						details,
+						...base
+					} = JSON.parse(row.entry_json);
+					const message = {
+						role: "hookMessage",
+						customType,
+						content,
+						display,
+						details,
+						timestamp: Date.parse(base.timestamp),
+					};
+					await c.db.execute(
+						`UPDATE pi_entry SET entry_json = ? WHERE seq = ?`,
+						JSON.stringify({ ...base, type: "message", message }),
+						row.seq,
+					);
+				}
+			},
+			storedFormat: async (c) => {
+				const [session] = await c.db.execute<{ version: number }>(
+					`SELECT json_extract(header_json, '$.version') AS version FROM pi_session`,
+				);
+				const entries = await c.db.execute<{ role: string }>(
+					`SELECT json_extract(entry_json, '$.message.role') AS role FROM pi_entry
+					 WHERE json_extract(entry_json, '$.type') = 'message' ORDER BY seq`,
+				);
+				return {
+					version: session?.version,
+					roles: entries.map((entry) => entry.role),
+				};
+			},
 		},
 	});
 	const sandboxed = pi({
@@ -176,6 +228,32 @@ describe("pi actor", () => {
 		await handle.prompt("say hello");
 		expect((await handle.getMessages()).length).toBeGreaterThan(
 			messagesBefore.length,
+		);
+	});
+
+	test("a session stored in an older Pi format is stored in the current format after the next wake", async (c) => {
+		const { client } = await setupTest(c, registry);
+		const handle = client.agent.getOrCreate(["old-format", randomUUID()]);
+		await handle.addNote("remember this");
+		await handle.storeInVersion2Format();
+
+		await handle.nap();
+		// Sleep finishes after the `nap` action returns, so poll the persisted
+		// counter until the sleep hook has run.
+		await vi.waitFor(async () => {
+			expect(await handle.sleeps()).toBeGreaterThanOrEqual(1);
+		});
+
+		expect(await handle.storedFormat()).toEqual({
+			version: 3,
+			roles: ["custom"],
+		});
+		expect(await handle.getMessages()).toContainEqual(
+			expect.objectContaining({
+				role: "custom",
+				customType: "note",
+				content: "remember this",
+			}),
 		);
 	});
 
