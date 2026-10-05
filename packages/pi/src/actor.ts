@@ -1,16 +1,30 @@
-import type { AgentSessionEvent } from "@earendil-works/pi-coding-agent";
+import type {
+	AgentSession,
+	AgentSessionEvent,
+} from "@earendil-works/pi-coding-agent";
 import {
-	type Actions,
+	type ActionContext,
 	type ActorConfigInput,
 	type ActorDefinition,
 	actor,
+	type Conn,
+	type ConnectContext,
+	type DestroyContext,
+	type DisconnectContext,
 	type EventSchemaConfig,
 	event,
 	type QueueSchemaConfig,
+	type SleepContext,
 	type Type,
+	type WakeContext,
 } from "rivetkit";
 import { db } from "rivetkit/db";
 import { createPiActions, type PiActions } from "./actions.js";
+import {
+	type ClientActions,
+	type DistributiveOmit,
+	wrapActions,
+} from "./actor-types.js";
 import {
 	closePiSession,
 	createPiRuntime,
@@ -19,6 +33,7 @@ import {
 	type PiDatabaseProvider,
 	type PiSessionOptions,
 	resumeInterruptedRun,
+	withPiSession,
 } from "./runtime.js";
 import { migratePiTables } from "./storage.js";
 
@@ -59,6 +74,146 @@ const piOptionKeys = [
 	"sandbox",
 ] as const satisfies readonly (keyof PiSessionOptions)[];
 
+/** `c.pi`: the actor's Pi session, in the app's own actions and hooks. */
+export interface PiAccess {
+	readonly pi: AgentSession;
+}
+
+/** The app's own actions, which get `c.pi`. Nested objects become dotted action names. */
+export interface PiUserActions<
+	TState,
+	TConnParams,
+	TConnState,
+	TVars,
+	TInput,
+	TEvents extends EventSchemaConfig,
+	TQueues extends QueueSchemaConfig,
+> {
+	[action: string]:
+		| ((
+				c: ActionContext<
+					TState,
+					TConnParams,
+					TConnState,
+					TVars,
+					TInput,
+					PiDatabaseProvider,
+					TEvents,
+					TQueues
+				> &
+					PiAccess,
+				...args: any[]
+		  ) => any)
+		| PiUserActions<
+				TState,
+				TConnParams,
+				TConnState,
+				TVars,
+				TInput,
+				TEvents,
+				TQueues
+		  >;
+}
+
+/** Lifecycle hooks that get `c.pi`. */
+interface PiHooks<
+	TState,
+	TConnParams,
+	TConnState,
+	TVars,
+	TInput,
+	TEvents extends EventSchemaConfig,
+	TQueues extends QueueSchemaConfig,
+> {
+	onWake?: (
+		c: WakeContext<
+			TState,
+			TConnParams,
+			TConnState,
+			TVars,
+			TInput,
+			PiDatabaseProvider,
+			TEvents,
+			TQueues
+		> &
+			PiAccess,
+	) => void | Promise<void>;
+	onSleep?: (
+		c: SleepContext<
+			TState,
+			TConnParams,
+			TConnState,
+			TVars,
+			TInput,
+			PiDatabaseProvider,
+			TEvents,
+			TQueues
+		> &
+			PiAccess,
+	) => void | Promise<void>;
+	onDestroy?: (
+		c: DestroyContext<
+			TState,
+			TConnParams,
+			TConnState,
+			TVars,
+			TInput,
+			PiDatabaseProvider,
+			TEvents,
+			TQueues
+		> &
+			PiAccess,
+	) => void | Promise<void>;
+	onConnect?: (
+		c: ConnectContext<
+			TState,
+			TConnParams,
+			TConnState,
+			TVars,
+			TInput,
+			PiDatabaseProvider,
+			TEvents,
+			TQueues
+		> &
+			PiAccess,
+		conn: Conn<
+			TState,
+			TConnParams,
+			TConnState,
+			TVars,
+			TInput,
+			PiDatabaseProvider,
+			TEvents,
+			TQueues
+		>,
+	) => void | Promise<void>;
+	onDisconnect?: (
+		c: DisconnectContext<
+			TState,
+			TConnParams,
+			TConnState,
+			TVars,
+			TInput,
+			PiDatabaseProvider,
+			TEvents,
+			TQueues
+		> &
+			PiAccess,
+		conn: Conn<
+			TState,
+			TConnParams,
+			TConnState,
+			TVars,
+			TInput,
+			PiDatabaseProvider,
+			TEvents,
+			TQueues
+		>,
+	) => void | Promise<void>;
+}
+
+type WrappedKey = "actions" | keyof PiHooks<any, any, any, any, any, any, any>;
+
 export type PiActorConfigInput<
 	TState = undefined,
 	TConnParams = undefined,
@@ -67,7 +222,17 @@ export type PiActorConfigInput<
 	TInput = undefined,
 	TEvents extends EventSchemaConfig = Record<never, never>,
 	TQueues extends QueueSchemaConfig = Record<never, never>,
-	TUserActions extends Actions<
+	TUserActions extends PiUserActions<
+		TState,
+		TConnParams,
+		TConnState,
+		TVars,
+		TInput,
+		TEvents,
+		TQueues
+	> = Record<never, never>,
+> = DistributiveOmit<
+	ActorConfigInput<
 		TState,
 		TConnParams,
 		TConnState,
@@ -76,25 +241,11 @@ export type PiActorConfigInput<
 		PiDatabaseProvider,
 		TEvents,
 		TQueues
-	> = Record<never, never>,
-> = ActorConfigInput<
-	TState,
-	TConnParams,
-	TConnState,
-	TVars,
-	TInput,
-	PiDatabaseProvider,
-	TEvents,
-	TQueues,
-	TUserActions
+	>,
+	WrappedKey
 > &
-	PiSessionOptions;
-
-/**
- * The actions the user defined. With no `actions` option, TypeScript uses the
- * default, a record with an index signature, which would hide the Pi actions.
- */
-type UserActions<T> = string extends keyof T ? Record<never, never> : T;
+	PiHooks<TState, TConnParams, TConnState, TVars, TInput, TEvents, TQueues> &
+	PiSessionOptions & { actions?: TUserActions };
 
 /**
  * Defines a Rivet Actor that owns one Pi coding-agent session.
@@ -102,6 +253,7 @@ type UserActions<T> = string extends keyof T ? Record<never, never> : T;
  * The session transcript and settings live in the actor's SQLite database and
  * are restored when the actor wakes. Pi events are broadcast on `event`.
  * Ordinary actor config (state, vars, actions, events, hooks) is passed through.
+ * The app's own actions and lifecycle hooks get the session as `c.pi`.
  */
 export function pi<
 	TState,
@@ -111,22 +263,20 @@ export function pi<
 	TInput,
 	TEvents extends EventSchemaConfig = Record<never, never>,
 	TQueues extends QueueSchemaConfig = Record<never, never>,
-	TUserActions extends Actions<
+	TUserActions extends PiUserActions<
 		TState,
 		TConnParams,
 		TConnState,
 		TVars,
 		TInput,
-		PiDatabaseProvider,
 		TEvents,
 		TQueues
-	> = Actions<
+	> = PiUserActions<
 		TState,
 		TConnParams,
 		TConnState,
 		TVars,
 		TInput,
-		PiDatabaseProvider,
 		TEvents,
 		TQueues
 	>,
@@ -159,7 +309,20 @@ export function pi<
 	PiDatabaseProvider,
 	TEvents & PiEvents,
 	TQueues,
-	UserActions<TUserActions> & PiActions
+	ClientActions<
+		TUserActions,
+		ActionContext<
+			TState,
+			TConnParams,
+			TConnState,
+			TVars,
+			TInput,
+			PiDatabaseProvider,
+			TEvents,
+			TQueues
+		>
+	> &
+		PiActions
 > {
 	const { actorConfig, sessionOptions } = splitConfig(config);
 	if (actorConfig.db !== undefined) {
@@ -169,11 +332,17 @@ export function pi<
 	assertNoReservedKeys("action", actorConfig.actions, actions);
 	assertNoReservedKeys("event", actorConfig.events, piEvents);
 
+	const withPi = <TArgs extends unknown[]>(
+		hook: ((c: PiContext, ...args: TArgs) => unknown) | undefined,
+	) =>
+		hook &&
+		((c: PiContext, ...args: TArgs) =>
+			withPiSession(c, sessionOptions, () => hook(c, ...args)));
 	const userVars = actorConfig.vars;
 	const userCreateVars = actorConfig.createVars;
-	const userOnWake = actorConfig.onWake;
-	const userOnSleep = actorConfig.onSleep;
-	const userOnDestroy = actorConfig.onDestroy;
+	const userOnWake = withPi(actorConfig.onWake);
+	const userOnSleep = withPi(actorConfig.onSleep);
+	const userOnDestroy = withPi(actorConfig.onDestroy);
 	delete actorConfig.vars;
 	const sleepGracePeriod: number =
 		actorConfig.options?.sleepGracePeriod ?? DEFAULT_SLEEP_GRACE_PERIOD_MS;
@@ -187,7 +356,12 @@ export function pi<
 		},
 		db: db({ onMigrate: migratePiTables }),
 		events: { ...(actorConfig.events ?? {}), ...piEvents },
-		actions: { ...(actorConfig.actions ?? {}), ...actions },
+		actions: {
+			...wrapActions(actorConfig.actions ?? {}, (c: PiContext, action) =>
+				withPiSession(c, sessionOptions, action),
+			),
+			...actions,
+		},
 		createVars: async (c: unknown, driverCtx: unknown) => {
 			const vars = userCreateVars
 				? await userCreateVars(c, driverCtx)
@@ -205,6 +379,8 @@ export function pi<
 				});
 			});
 		},
+		onConnect: withPi(actorConfig.onConnect),
+		onDisconnect: withPi(actorConfig.onDisconnect),
 		onSleep: async (c: PiContext) => {
 			try {
 				await userOnSleep?.(c);
@@ -219,17 +395,7 @@ export function pi<
 				await closePiSession(c, sessionOptions, "destroy", sleepGracePeriod);
 			}
 		},
-	} as any) as ActorDefinition<
-		TState,
-		TConnParams,
-		TConnState,
-		TVars,
-		TInput,
-		PiDatabaseProvider,
-		TEvents & PiEvents,
-		TQueues,
-		UserActions<TUserActions> & PiActions
-	>;
+	} as any) as any;
 }
 
 function splitConfig(config: object): {

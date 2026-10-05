@@ -25,6 +25,9 @@ let sandboxProviderDown = false;
 /** Sleeps of the `sandboxed` actors by key, recorded in this process where they run. */
 const sandboxedSleeps = new Map<string, number>();
 
+/** What `c.pi` gave each `closing` actor's onDisconnect hook, by key, recorded in this process. */
+const disconnectOutcomes = new Map<string, string>();
+
 let mockModel: MockModel;
 let workdir: string;
 let registry: ReturnType<typeof buildRegistry>;
@@ -73,7 +76,26 @@ function buildRegistry(mock: MockModel, root: string) {
 		apiKeys: { mock: "mock" },
 		options: { actionTimeout: 1_000 },
 	});
-	return setup({ use: { agent, sandboxed, timed } });
+	const closing = pi({
+		model: "mock/mock-model",
+		providers: { mock: mock.providerConfig },
+		apiKeys: { mock: "mock" },
+		onDisconnect: (c) => {
+			let outcome: string;
+			try {
+				outcome = `open ${c.pi.sessionId}`;
+			} catch (error) {
+				outcome = (error as Error).message;
+			}
+			disconnectOutcomes.set(JSON.stringify(c.key), outcome);
+		},
+		actions: {
+			destroySelf: (c) => {
+				c.destroy();
+			},
+		},
+	});
+	return setup({ use: { agent, sandboxed, timed, closing } });
 }
 
 beforeAll(async () => {
@@ -307,6 +329,22 @@ describe("pi actor", () => {
 		const output = JSON.stringify(toolResult(events, "bash"));
 		expect(output).toContain("key=[]");
 		expect(output).not.toContain("host-key");
+		await conn.dispose();
+	});
+
+	test("a hook that runs after the session closed gets an error from c.pi instead of reopening it", async (c) => {
+		const { client } = await setupTest(c, registry);
+		const key = ["closed", randomUUID()];
+		const conn = client.closing.getOrCreate(key).connect();
+		await conn.getSession();
+
+		await client.closing.getOrCreate(key).destroySelf();
+		// Destroy closes the session, then disconnects the connection; the hook records what c.pi gave in this process.
+		await vi.waitFor(() =>
+			expect(disconnectOutcomes.get(JSON.stringify(key))).toBe(
+				"The Pi session is closed because the actor is stopping.",
+			),
+		);
 		await conn.dispose();
 	});
 

@@ -11,7 +11,7 @@ import {
 	SettingsManager,
 } from "@earendil-works/pi-coding-agent";
 import type { Sandbox, SandboxProvider } from "@rivet-dev/sandbox-adapter";
-import type { ActorContext } from "rivetkit";
+import { type ActorContext, UserError } from "rivetkit";
 import type { DatabaseProvider, RawAccess } from "rivetkit/db";
 import { SourceCredentialStore } from "./credentials.js";
 import {
@@ -123,12 +123,14 @@ export interface PiRuntime {
 	ready?: Promise<PiSession>;
 	/** Serializes SQLite entry writes so entries keep their append order. Never rejects. */
 	writes: Promise<void>;
+	/** Set once the session closes for sleep or destroy. It never reopens in this generation. */
+	closing: boolean;
 }
 
 export const PI_RUNTIME: unique symbol = Symbol.for("@rivet-dev/pi/runtime");
 
 export function createPiRuntime(): PiRuntime {
-	return { writes: Promise.resolve() };
+	return { writes: Promise.resolve(), closing: false };
 }
 
 export function piRuntime(c: PiContext): PiRuntime {
@@ -149,6 +151,9 @@ export function ensurePiSession(
 	options: PiSessionOptions,
 ): Promise<PiSession> {
 	const runtime = piRuntime(c);
+	if (runtime.closing) {
+		return Promise.reject(sessionClosed());
+	}
 	if (!runtime.ready) {
 		runtime.ready = openPiSession(c, runtime, options).catch((error) => {
 			runtime.ready = undefined;
@@ -156,6 +161,49 @@ export function ensurePiSession(
 		});
 	}
 	return runtime.ready;
+}
+
+/**
+ * Runs the app's own action or hook with `c.pi` set to the session, then
+ * saves what it changed, such as the model, as the built-in actions do.
+ */
+export async function withPiSession<T>(
+	c: PiContext,
+	options: PiSessionOptions,
+	body: () => T | Promise<T>,
+): Promise<T> {
+	// Hooks such as onDisconnect still run after the session closed; only using c.pi fails.
+	if (piRuntime(c).closing) {
+		Object.defineProperty(c, "pi", {
+			get: () => {
+				throw sessionClosed();
+			},
+			configurable: true,
+		});
+		return body();
+	}
+	const handle = await ensurePiSession(c, options);
+	Object.defineProperty(c, "pi", { value: handle.session, configurable: true });
+	let result: T;
+	try {
+		result = await body();
+	} catch (error) {
+		await persistPiState(c, handle).catch((writeError: unknown) => {
+			c.log.error({
+				msg: "pi state write failed after an app action error",
+				error: writeError,
+			});
+		});
+		throw error;
+	}
+	await persistPiState(c, handle);
+	return result;
+}
+
+function sessionClosed() {
+	return new UserError(
+		"The Pi session is closed because the actor is stopping.",
+	);
 }
 
 /** Pi's built-in tools, which all run on the actor host. */
@@ -588,6 +636,7 @@ export async function closePiSession(
 				: open.session.abort(),
 		);
 	}
+	runtime.closing = true;
 	runtime.ready = undefined;
 
 	if (handle) {
