@@ -24,10 +24,14 @@ import { createSandboxBashOperations, createSandboxTools } from "./sandbox.js";
 import {
 	appendPiEntry,
 	createPiSession,
+	loadPiInterruptedRun,
 	loadPiSandbox,
 	loadPiSession,
+	type PiQueue,
 	type PiSettings,
 	type StoredSandbox,
+	savePiIdle,
+	savePiRunning,
 	savePiSandbox,
 	savePiSettings,
 	toFileEntries,
@@ -255,6 +259,17 @@ async function openPiSession(
 				});
 			});
 		}
+		// The run state tells the next wake whether a run was cut off.
+		if (
+			event.type === "agent_start" ||
+			(event.type === "queue_update" && session.isStreaming)
+		) {
+			void writeInOrder(c, runtime, () =>
+				savePiRunning(c.db, queuedMessages(session)),
+			);
+		} else if (event.type === "agent_settled") {
+			void writeInOrder(c, runtime, () => savePiIdle(c.db));
+		}
 	});
 
 	c.log.info({
@@ -371,6 +386,95 @@ function flushPiEntries(
 	return write;
 }
 
+/** Runs a SQLite write after the entry writes queued before it. */
+function writeInOrder(
+	c: PiContext,
+	runtime: PiRuntime,
+	write: () => Promise<void>,
+): Promise<void> {
+	const next = runtime.writes.then(write);
+	runtime.writes = next.catch((error: unknown) => {
+		c.log.error({ msg: "pi run state write failed", error });
+	});
+	return next;
+}
+
+function queuedMessages(session: AgentSession): PiQueue {
+	return {
+		steering: [...session.getSteeringMessages()],
+		followUp: [...session.getFollowUpMessages()],
+	};
+}
+
+/**
+ * Continues the run that was active when the actor stopped, when Pi's own
+ * `Agent.continue()` accepts the transcript: its last message is a user or a
+ * tool result message. Otherwise the chat stays as Pi left it, as after an
+ * abort. The run continues in the background and keeps the actor awake.
+ */
+export async function resumeInterruptedRun(
+	c: PiContext,
+	options: PiSessionOptions,
+): Promise<void> {
+	const queue = await loadPiInterruptedRun(c.db);
+	if (!queue) return;
+	const handle = await ensurePiSession(c, options);
+	const lastRole = handle.session.messages.at(-1)?.role;
+	if (lastRole !== "user" && lastRole !== "toolResult") {
+		c.log.info({
+			msg: "pi run stopped where Pi cannot continue it, leaving the chat as is",
+			lastRole,
+		});
+		await writeInOrder(c, piRuntime(c), () => savePiIdle(c.db));
+		return;
+	}
+	c.log.info({
+		msg: "resuming the pi run that was active when the actor stopped",
+		lastRole,
+	});
+	const run = continueRun(handle.session, queue)
+		.then(() => persistPiState(c, handle))
+		.catch((error: unknown) => {
+			c.log.error({ msg: "resumed pi run failed", error });
+		});
+	void c.keepAwake(run);
+}
+
+/** The private `AgentSession` methods that resume uses. */
+interface AgentSessionInternals {
+	_runAgentPrompt(messages: unknown[]): Promise<void>;
+	_queueSteer(text: string): Promise<void>;
+	_queueFollowUp(text: string): Promise<void>;
+}
+
+/**
+ * Runs `AgentSession`'s own run loop from the stored transcript, so retry,
+ * compaction, and queued messages work as in any run. The loop starts with
+ * `agent.prompt`; for that one call it continues instead. `pi-coding-agent`
+ * is pinned exactly, and the resume test fails if these methods change.
+ */
+async function continueRun(
+	session: AgentSession,
+	queue: PiQueue,
+): Promise<void> {
+	const internals = session as unknown as AgentSessionInternals;
+	for (const text of queue.steering) await internals._queueSteer(text);
+	for (const text of queue.followUp) await internals._queueFollowUp(text);
+	const agent = session.agent;
+	Object.defineProperty(agent, "prompt", {
+		configurable: true,
+		value: async () => {
+			Reflect.deleteProperty(agent, "prompt");
+			await agent.continue();
+		},
+	});
+	try {
+		await internals._runAgentPrompt([]);
+	} finally {
+		Reflect.deleteProperty(agent, "prompt");
+	}
+}
+
 function broadcastSessionEvent(c: PiContext, event: AgentSessionEvent): void {
 	try {
 		c.broadcast("event", event);
@@ -403,18 +507,50 @@ export async function persistPiState(
 }
 
 /**
- * Stops the Pi session for this actor generation: aborts any run, lets
- * extensions shut down, and flushes settings and entries. Then suspends the
- * sandbox on sleep, or destroys it on destroy.
+ * Waits until the session is idle, or until `gracePeriodMs` passes. Idle
+ * sleep never has a run, so this only waits on a forced stop, such as a deploy.
+ * RivetKit stops waiting for `onSleep` at the same deadline, so closing after
+ * a drain that timed out is best effort. Pi stores each message as it ends,
+ * and the next wake resumes the run.
+ */
+async function drain(
+	c: PiContext,
+	session: AgentSession,
+	gracePeriodMs: number,
+): Promise<void> {
+	if (session.isIdle) return;
+	let timer: ReturnType<typeof setTimeout> | undefined;
+	const gracePeriodEnded = new Promise<true>((resolve) => {
+		timer = setTimeout(() => resolve(true), gracePeriodMs);
+	});
+	try {
+		const idle = session.waitForIdle().then(() => false as const);
+		if (await Promise.race([idle, gracePeriodEnded])) {
+			c.log.warn({
+				msg: "pi run still active at the end of the grace period; it resumes on wake when Pi can continue it",
+			});
+		}
+	} finally {
+		clearTimeout(timer);
+	}
+}
+
+/**
+ * Stops the Pi session for this actor generation. On sleep it first waits, at
+ * most `gracePeriodMs`, for a run to finish. A run still active then is not
+ * aborted: the transcript ends at the last message Pi stored, and the next
+ * wake resumes it. On destroy it aborts the run at once, since nothing would
+ * resume it. Then lets extensions shut down, flushes settings and entries,
+ * and suspends the sandbox on sleep, or destroys it on destroy.
  */
 export async function closePiSession(
 	c: PiContext,
 	options: PiSessionOptions,
 	reason: "sleep" | "destroy",
+	gracePeriodMs: number,
 ): Promise<void> {
 	const runtime = piRuntime(c);
 	const ready = runtime.ready;
-	runtime.ready = undefined;
 	const errors: unknown[] = [];
 	let handle: PiSession | undefined;
 	try {
@@ -423,7 +559,16 @@ export async function closePiSession(
 
 	if (handle) {
 		const open = handle;
-		await attempt(errors, () => open.session.abort());
+		await attempt(errors, () =>
+			reason === "sleep"
+				? drain(c, open.session, gracePeriodMs)
+				: open.session.abort(),
+		);
+	}
+	runtime.ready = undefined;
+
+	if (handle) {
+		const open = handle;
 		await attempt(errors, async () => {
 			if (open.session.hasExtensionHandlers("session_shutdown")) {
 				await open.session.extensionRunner.emit({
