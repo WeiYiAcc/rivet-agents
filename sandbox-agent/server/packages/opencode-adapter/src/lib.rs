@@ -3491,6 +3491,8 @@ fn provider_to_agent(provider_id: &str) -> String {
         "codex" => "codex".to_string(),
         "claude" => "claude".to_string(),
         "opencode" => "opencode".to_string(),
+        "pi" => "pi".to_string(),
+        "cursor" => "cursor".to_string(),
         _ => "mock".to_string(),
     }
 }
@@ -3555,6 +3557,8 @@ fn default_model_for_provider(provider_id: &str) -> Option<&'static str> {
         "amp" => Some("smart"),
         "claude" => Some("default"),
         "codex" => Some("gpt-5"),
+        "pi" => Some("default"),
+        "cursor" => Some("auto"),
         _ => None,
     }
 }
@@ -3567,6 +3571,8 @@ fn provider_for_model(model_id: &str) -> Option<&'static str> {
         "default" | "sonnet" | "haiku" | "opus" => Some("claude"),
         _ if model_id.starts_with("claude-") => Some("claude"),
         _ if model_id.starts_with("gpt-") => Some("codex"),
+        _ if model_id.starts_with("pi-") => Some("pi"),
+        _ if model_id.starts_with("cursor-") => Some("cursor"),
         _ if model_id.contains('/') => Some("opencode"),
         _ if model_id.starts_with("opencode/") => Some("opencode"),
         _ => None,
@@ -3579,6 +3585,8 @@ fn default_for_agent(agent: &str) -> Option<(&'static str, &'static str)> {
         "amp" => Some(("amp", "smart")),
         "claude" => Some(("claude", "default")),
         "codex" => Some(("codex", "gpt-5")),
+        "pi" => Some(("pi", "default")),
+        "cursor" => Some(("cursor", "auto")),
         _ => None,
     }
 }
