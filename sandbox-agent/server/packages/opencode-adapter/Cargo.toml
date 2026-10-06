@@ -17,4 +17,5 @@ tracing.workspace = true
 sandbox-agent-error.workspace = true
 sandbox-agent-opencode-server-manager.workspace = true
 reqwest.workspace = true
+percent-encoding.workspace = true
 sqlx = { version = "0.8", default-features = false, features = ["runtime-tokio-rustls", "sqlite", "migrate"] }

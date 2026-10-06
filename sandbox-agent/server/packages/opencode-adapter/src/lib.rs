@@ -3619,9 +3619,27 @@ fn parse_last_event_id(headers: &HeaderMap) -> Option<u64> {
         .and_then(|value| value.trim().parse::<u64>().ok())
 }
 
+fn decode_directory_value(value: &str) -> String {
+    // OpenCode clients percent-encode the directory (e.g. `%2Fhome%2Fsandbox`)
+    // in both the `directory` query param and the `x-opencode-directory`
+    // header. Decode it; if the result still looks percent-encoded
+    // (double-encoding), decode once more.
+    let decoded = percent_encoding::percent_decode_str(value)
+        .decode_utf8()
+        .map(|cow| cow.into_owned())
+        .unwrap_or_else(|_| value.to_string());
+    if decoded.starts_with("%2F") || decoded.starts_with("%2f") {
+        return percent_encoding::percent_decode_str(&decoded)
+            .decode_utf8()
+            .map(|cow| cow.into_owned())
+            .unwrap_or(decoded);
+    }
+    decoded
+}
+
 fn resolve_directory(headers: &HeaderMap, query_directory: Option<&String>) -> String {
     if let Some(value) = query_directory {
-        return value.clone();
+        return decode_directory_value(value);
     }
 
     if let Ok(value) = std::env::var("OPENCODE_COMPAT_DIRECTORY") {
@@ -3635,7 +3653,7 @@ fn resolve_directory(headers: &HeaderMap, query_directory: Option<&String>) -> S
         .and_then(|v| v.to_str().ok())
     {
         if !value.trim().is_empty() {
-            return value.to_string();
+            return decode_directory_value(value);
         }
     }
 
